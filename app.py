@@ -154,3 +154,73 @@ with col_logs:
     if st.session_state.trade_log:
         log_df = pd.DataFrame(st.session_state.trade_log)
         st.dataframe(log_df.iloc[::-1], height=400) # Show newest first
+def run_strategy(exchange):
+    # 1. VISUAL FEEDBACK: Tell the user we are scanning
+    status_placeholder = st.empty() 
+    status_placeholder.info("🔄 Scanning the market for opportunities...")
+    
+    # Fallback: If scanner fails, look at these specific coins
+    top_coins = fetch_top_coins(exchange)
+    if not top_coins:
+        top_coins = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT']
+    
+    for symbol in top_coins:
+        # Show which coin is being checked right now
+        status_placeholder.markdown(f"**Checking:** `{symbol}` ...")
+        
+        df = get_market_data(exchange, symbol)
+        if df.empty: continue
+        
+        current_price = df['close'].iloc[-1]
+        sma_short = df['close'].rolling(window=5).mean().iloc[-1]
+        
+        # --- LOGIC UPDATE: RELAXED RULES FOR TESTING ---
+        # We lowered the barrier slightly so you can see a trade happen faster
+        
+        # BUY LOGIC
+        if symbol not in st.session_state.portfolio and len(st.session_state.portfolio) < MAX_POSITIONS:
+            # DEBUG: Print the condition values
+            # st.write(f"{symbol}: Price {current_price} vs SMA {sma_short}") 
+            
+            if current_price > sma_short:  
+                qty = ALLOCATION_PER_TRADE / current_price
+                cost = qty * current_price
+                if st.session_state.balance >= cost:
+                    st.session_state.balance -= cost
+                    st.session_state.portfolio[symbol] = {'amt': qty, 'avg_price': current_price}
+                    st.session_state.trade_log.append({
+                        "Time": datetime.now().strftime("%H:%M:%S"),
+                        "Symbol": symbol,
+                        "Type": "BUY",
+                        "Price": current_price,
+                        "Qty": qty,
+                        "P/L": 0
+                    })
+                    st.toast(f"✅ BOUGHT {symbol}!", icon="🚀")
+                    break # Stop scanning to update UI immediately
+
+        # SELL LOGIC
+        elif symbol in st.session_state.portfolio:
+            entry_price = st.session_state.portfolio[symbol]['avg_price']
+            qty = st.session_state.portfolio[symbol]['amt']
+            
+            # Sell if price drops OR if we made a tiny profit (0.1%) for testing
+            if current_price < sma_short or (current_price > entry_price * 1.001):
+                revenue = qty * current_price
+                pnl = revenue - (qty * entry_price)
+                st.session_state.balance += revenue
+                del st.session_state.portfolio[symbol]
+                st.session_state.trade_log.append({
+                    "Time": datetime.now().strftime("%H:%M:%S"),
+                    "Symbol": symbol,
+                    "Type": "SELL",
+                    "Price": current_price,
+                    "Qty": qty,
+                    "P/L": pnl
+                })
+                st.toast(f"🔻 SOLD {symbol}!", icon="💰")
+                break 
+    
+    # Clear the "Checking..." text when done loop
+    status_placeholder.empty()
+    
