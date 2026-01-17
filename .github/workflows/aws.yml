@@ -1,0 +1,219 @@
+import streamlit as st
+import ccxt
+import pandas as pd
+import time
+import plotly.graph_objects as go
+from datetime import datetime
+import json
+import os
+
+# --- CONFIGURATION ---
+START_CAPITAL = 1000000  # 10 Lakhs INR (Virtual)
+MAX_POSITIONS = 4        # Diversify into max 4 coins
+ALLOCATION_PER_TRADE = START_CAPITAL / MAX_POSITIONS
+DATA_FILE = "trading_state.json" # File to save your portfolio data
+
+# --- PERSISTENCE: SAVE & LOAD ---
+def save_data():
+    """Saves the current portfolio and balance to a permanent file."""
+    state = {
+        'balance': st.session_state.balance,
+        'portfolio': st.session_state.portfolio,
+        'trade_log': st.session_state.trade_log
+    }
+    try:
+        with open(DATA_FILE, 'w') as f:
+            json.dump(state, f)
+    except Exception as e:
+        st.error(f"Failed to save data: {e}")
+
+def load_data():
+    """Loads data from file if it exists."""
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+# --- INITIALIZE SESSION STATE ---
+if 'balance' not in st.session_state:
+    saved_data = load_data()
+    if saved_data:
+        st.session_state.balance = saved_data['balance']
+        st.session_state.portfolio = saved_data['portfolio']
+        st.session_state.trade_log = saved_data['trade_log']
+        # Toast helps you know data loaded successfully
+        # Note: Toasts might not show on first load depending on browser cache, but data will be there.
+    else:
+        st.session_state.balance = START_CAPITAL
+        st.session_state.portfolio = {}  # Format: {symbol: {'amt': 0, 'avg_price': 0}}
+        st.session_state.trade_log = []
+
+if 'is_running' not in st.session_state:
+    st.session_state.is_running = False
+
+# --- DATA ENGINE (CCXT) ---
+@st.cache_resource
+def get_exchange():
+    # using Binance public API
+    return ccxt.binance({'enableRateLimit': True})
+
+def fetch_top_coins(exchange, limit=10):
+    """Finds high volume coins to 'Pick' the best ones."""
+    try:
+        tickers = exchange.fetch_tickers()
+        valid_tickers = {k: v for k, v in tickers.items() if k.endswith('/USDT')}
+        sorted_tickers = sorted(valid_tickers.values(), key=lambda x: x['quoteVolume'], reverse=True)
+        return [t['symbol'] for t in sorted_tickers[:limit]]
+    except:
+        # Fallback list if API fails
+        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'XRP/USDT']
+
+def get_market_data(exchange, symbol):
+    """Fetches candles for strategy analysis."""
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=25)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+    except:
+        return pd.DataFrame()
+
+# --- MAIN TRADING LOGIC ---
+def run_strategy(exchange):
+    status_placeholder = st.empty()
+    status_placeholder.info("🔄 Scanning market for opportunities...")
+    
+    top_coins = fetch_top_coins(exchange)
+    
+    for symbol in top_coins:
+        # Update UI to show activity
+        status_placeholder.markdown(f"**Analyzing:** `{symbol}` ...")
+        
+        df = get_market_data(exchange, symbol)
+        if df.empty: continue
+        
+        current_price = df['close'].iloc[-1]
+        
+        # Strategy: Simple Moving Average Crossover + Momentum
+        sma_short = df['close'].rolling(window=5).mean().iloc[-1]
+        
+        # 1. BUY LOGIC
+        if symbol not in st.session_state.portfolio and len(st.session_state.portfolio) < MAX_POSITIONS:
+            # Condition: Price is ABOVE the 5-min average (Momentum Up)
+            if current_price > sma_short:
+                qty = ALLOCATION_PER_TRADE / current_price
+                cost = qty * current_price
+                
+                if st.session_state.balance >= cost:
+                    st.session_state.balance -= cost
+                    st.session_state.portfolio[symbol] = {'amt': qty, 'avg_price': current_price}
+                    
+                    st.session_state.trade_log.append({
+                        "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Symbol": symbol,
+                        "Type": "BUY",
+                        "Price": current_price,
+                        "Qty": qty,
+                        "P/L": 0
+                    })
+                    
+                    save_data()  # <--- CRITICAL: Save to disk
+                    st.toast(f"✅ Bought {symbol} at {current_price}", icon="🚀")
+                    break # Break loop to refresh UI immediately
+
+        # 2. SELL LOGIC
+        elif symbol in st.session_state.portfolio:
+            entry_price = st.session_state.portfolio[symbol]['avg_price']
+            qty = st.session_state.portfolio[symbol]['amt']
+            
+            # Condition: Price drops BELOW average OR small profit target (0.5%) hit
+            take_profit_price = entry_price * 1.005
+            
+            if current_price < sma_short or current_price >= take_profit_price:
+                revenue = qty * current_price
+                pnl = revenue - (qty * entry_price)
+                
+                st.session_state.balance += revenue
+                del st.session_state.portfolio[symbol]
+                
+                st.session_state.trade_log.append({
+                    "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "Symbol": symbol,
+                    "Type": "SELL",
+                    "Price": current_price,
+                    "Qty": qty,
+                    "P/L": pnl
+                })
+                
+                save_data() # <--- CRITICAL: Save to disk
+                st.toast(f"🔻 Sold {symbol} | P/L: {pnl:.2f}", icon="💰")
+                break # Break loop to refresh UI immediately
+
+    status_placeholder.empty()
+
+# --- UI LAYOUT ---
+st.set_page_config(page_title="AlgoTrader Pro", layout="wide")
+st.title("⚡ AI Crypto Algorithmic Trader")
+st.markdown(f"**Budget:** ₹10,00,000 | **Strategy:** SMA Momentum | **Storage:** Persistent (EC2)")
+
+# Sidebar Controls
+st.sidebar.header("Control Panel")
+if st.sidebar.button("▶ Start Bot"):
+    st.session_state.is_running = True
+if st.sidebar.button("⏹ Stop Bot"):
+    st.session_state.is_running = False
+
+# Metrics Calculation
+exchange = get_exchange()
+current_holdings_val = 0
+for s, p in st.session_state.portfolio.items():
+    # Fetch live price for accurate portfolio valuation
+    live_price_df = get_market_data(exchange, s)
+    if not live_price_df.empty:
+        current_holdings_val += p['amt'] * live_price_df['close'].iloc[-1]
+
+total_portfolio = st.session_state.balance + current_holdings_val
+pnl_total = total_portfolio - START_CAPITAL
+
+# Display Metrics
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Total Value", f"₹{total_portfolio:,.2f}", delta=f"{pnl_total:,.2f}")
+col2.metric("Cash", f"₹{st.session_state.balance:,.2f}")
+col3.metric("Invested", f"₹{current_holdings_val:,.2f}")
+col4.metric("Active Positions", len(st.session_state.portfolio))
+
+# --- EXECUTION LOOP ---
+if st.session_state.is_running:
+    run_strategy(exchange)
+    time.sleep(2) # Wait 2 seconds before next scan
+    st.rerun()    # Refresh the app
+
+# --- VISUALIZATION SECTION ---
+col_charts, col_logs = st.columns([2, 1])
+
+with col_charts:
+    st.subheader("Live Market (Top Asset)")
+    # If we hold coins, show the first one. If not, show BTC.
+    symbol_to_chart = list(st.session_state.portfolio.keys())[0] if st.session_state.portfolio else "BTC/USDT"
+    
+    df = get_market_data(exchange, symbol_to_chart)
+    if not df.empty:
+        fig = go.Figure(data=[go.Candlestick(
+            x=df['timestamp'], open=df['open'], high=df['high'], 
+            low=df['low'], close=df['close']
+        )])
+        fig.update_layout(title=f"Chart: {symbol_to_chart}", height=400, xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("Unable to fetch chart data.")
+
+with col_logs:
+    st.subheader("Trade Log")
+    if st.session_state.trade_log:
+        log_df = pd.DataFrame(st.session_state.trade_log)
+        st.dataframe(log_df.iloc[::-1], height=400, use_container_width=True)
+    else:
+        st.info("No trades executed yet.")
